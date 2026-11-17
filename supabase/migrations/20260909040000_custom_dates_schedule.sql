@@ -1,0 +1,321 @@
+-- Manual QA Gap Fix — Program Operations Closure
+--
+-- §16-18: 월1회/비정기 Program을 위한 "직접 회차 지정" 방식을 추가한다. 기존
+-- "정기 반복"(요일 기반 compute_session_dates)은 그대로 두고, operation_terms에
+-- schedule_mode 컬럼 하나만 추가한다(대규모 재설계 아님). weekdays 컬럼은
+-- schedule_mode='weekly'일 때만 비어있지 않으면 되도록 기존 CHECK를 완화한다
+-- -- "월1회 -> 매월 첫째주 자동생성" 같은 추측 규칙은 만들지 않는다. 사용자가
+-- 고른 날짜 그대로만 회차가 된다.
+
+alter table public.operation_terms
+  add column schedule_mode text not null default 'weekly'
+    constraint operation_terms_schedule_mode_valid check (schedule_mode in ('weekly', 'custom_dates'));
+
+alter table public.operation_terms
+  drop constraint operation_terms_weekdays_valid,
+  add constraint operation_terms_weekdays_valid check (
+    weekdays <@ array[1, 2, 3, 4, 5, 6, 7]::smallint[]
+    and (schedule_mode = 'custom_dates' or array_length(weekdays, 1) > 0)
+  );
+
+-- list_operation_cycle_program_status: schedule_mode도 함께 반환한다(§26 UI가
+-- "일정방식"을 표시해야 함). 반환 컬럼이 늘어나 row type이 바뀌므로 DROP 후
+-- 재생성해야 한다(CREATE OR REPLACE는 OUT parameter 구성 변경을 허용하지 않음).
+drop function if exists public.list_operation_cycle_program_status(uuid);
+
+create function public.list_operation_cycle_program_status(p_operation_cycle_id uuid)
+returns table (
+  out_program_id uuid,
+  out_activity_id uuid,
+  out_name text,
+  out_has_term boolean,
+  out_operation_term_id uuid,
+  out_schedule_mode text,
+  out_weekdays smallint[],
+  out_start_time time,
+  out_end_time time,
+  out_instructor_name text,
+  out_instructor_name_text text,
+  out_session_count integer,
+  out_enrollment_count integer,
+  out_initial_roster_applied boolean
+)
+language plpgsql
+security definer set search_path = public
+stable
+as $$
+declare
+  v_org uuid;
+begin
+  v_org := public.current_organization_id();
+  if v_org is null then
+    raise exception '조직 정보를 확인할 수 없습니다.';
+  end if;
+  if not exists (select 1 from public.operation_cycles where id = p_operation_cycle_id and organization_id = v_org) then
+    raise exception '운영구분을 찾을 수 없습니다.';
+  end if;
+
+  return query
+    select
+      p.id,
+      a.id,
+      p.name,
+      ot.id is not null,
+      ot.id,
+      ot.schedule_mode,
+      ot.weekdays,
+      ot.session_start_time,
+      ot.session_end_time,
+      ip.name,
+      ot.instructor_name_text,
+      (select count(*)::integer from public.sessions s where s.operation_term_id = ot.id),
+      (select count(*)::integer from public.enrollments e where e.operation_term_id = ot.id and e.end_session_no_exclusive is null),
+      ot.initial_roster_applied_at is not null
+    from public.operation_cycle_programs ocp
+    join public.programs p on p.id = ocp.program_id
+    join public.activities a on a.id = p.activity_id
+    left join public.operation_terms ot
+      on ot.operation_cycle_id = p_operation_cycle_id and ot.program_id = p.id
+    left join public.principals ip on ip.id = ot.instructor_principal_id
+    where ocp.operation_cycle_id = p_operation_cycle_id
+      and public.can_read_activity(a.id)
+    order by p.name;
+end;
+$$;
+
+-- upsert_operation_term_for_cycle: p_schedule_mode='custom_dates'일 때는
+-- p_explicit_dates(사용자가 고른 실제 날짜)로만 회차를 만든다. "월N회 ->
+-- 임의 추측"은 하지 않는다 -- 날짜가 명시적으로 주어지지 않으면 오류.
+create or replace function public.upsert_operation_term_for_cycle(
+  p_operation_cycle_id uuid,
+  p_program_id uuid,
+  p_weekdays smallint[],
+  p_start_time time,
+  p_end_time time,
+  p_instructor_principal_id uuid,
+  p_excluded_dates date[] default '{}',
+  p_instructor_name_text text default null,
+  p_schedule_mode text default 'weekly',
+  p_explicit_dates date[] default null
+)
+returns table (out_term_id uuid, out_created boolean, out_sessions_regenerated boolean)
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  v_org uuid;
+  v_cycle_org uuid;
+  v_cycle_start date;
+  v_cycle_end date;
+  v_cycle_year uuid;
+  v_cycle_name text;
+  v_activity_id uuid;
+  v_term_id uuid;
+  v_cur_weekdays smallint[];
+  v_cur_start time;
+  v_cur_end time;
+  v_cur_instructor uuid;
+  v_cur_instructor_text text;
+  v_cur_schedule_mode text;
+  v_protected_count integer;
+  v_seq integer;
+  v_date date;
+  v_conflict_cycle_name text;
+  v_instructor_text text;
+  v_final_weekdays smallint[];
+  v_unchanged boolean;
+begin
+  v_org := public.current_organization_id();
+  select organization_id, start_date, end_date, business_year_id, name
+    into v_cycle_org, v_cycle_start, v_cycle_end, v_cycle_year, v_cycle_name
+  from public.operation_cycles where id = p_operation_cycle_id;
+  if v_cycle_org is null or v_cycle_org <> v_org then
+    raise exception '운영구분을 찾을 수 없습니다.';
+  end if;
+
+  select a.id into v_activity_id
+  from public.programs p join public.activities a on a.id = p.activity_id
+  where p.id = p_program_id;
+  if v_activity_id is null then
+    raise exception '프로그램을 찾을 수 없습니다.';
+  end if;
+  if not public.can_manage_activity(v_activity_id) then
+    raise exception '이 프로그램의 운영정보를 설정할 권한이 없습니다.';
+  end if;
+  if not exists (
+    select 1 from public.operation_cycle_programs
+    where operation_cycle_id = p_operation_cycle_id and program_id = p_program_id
+  ) then
+    raise exception '이 프로그램은 현재 운영구분에 선택되지 않았습니다. 먼저 프로그램을 선택해 주세요.';
+  end if;
+
+  if p_schedule_mode not in ('weekly', 'custom_dates') then
+    raise exception '일정방식을 확인해 주세요.';
+  end if;
+  if p_start_time is null or p_end_time is null then
+    raise exception '시작/종료 시간을 입력해 주세요.';
+  end if;
+  if p_end_time <= p_start_time then
+    raise exception '종료시간은 시작시간보다 늦어야 합니다.';
+  end if;
+
+  if p_schedule_mode = 'weekly' then
+    if p_weekdays is null or array_length(p_weekdays, 1) is null then
+      raise exception '요일을 1개 이상 선택해 주세요.';
+    end if;
+    v_final_weekdays := p_weekdays;
+  else
+    if p_explicit_dates is null or array_length(p_explicit_dates, 1) is null then
+      raise exception '직접 회차 지정은 날짜를 1개 이상 선택해야 합니다.';
+    end if;
+    if exists (
+      select 1 from unnest(p_explicit_dates) as d
+      where d < v_cycle_start or d > v_cycle_end
+    ) then
+      raise exception '선택한 날짜가 운영구분 기간(%~%) 밖에 있습니다.', v_cycle_start, v_cycle_end;
+    end if;
+    v_final_weekdays := '{}'::smallint[];
+  end if;
+
+  if p_instructor_principal_id is not null and not exists (
+    select 1 from public.principals
+    where id = p_instructor_principal_id and organization_id = v_org
+      and principal_type = 'instructor' and is_active = true
+  ) then
+    raise exception '강사를 찾을 수 없거나 비활성 상태입니다.';
+  end if;
+
+  v_instructor_text := case
+    when p_instructor_principal_id is not null then null
+    else nullif(trim(coalesce(p_instructor_name_text, '')), '')
+  end;
+
+  select id, weekdays, session_start_time, session_end_time, instructor_principal_id, instructor_name_text, schedule_mode
+    into v_term_id, v_cur_weekdays, v_cur_start, v_cur_end, v_cur_instructor, v_cur_instructor_text, v_cur_schedule_mode
+  from public.operation_terms
+  where operation_cycle_id = p_operation_cycle_id and program_id = p_program_id;
+
+  if v_term_id is null then
+    select oc.name into v_conflict_cycle_name
+    from public.operation_terms ot
+    join public.operation_cycles oc on oc.id = ot.operation_cycle_id
+    where ot.program_id = p_program_id
+      and ot.operation_cycle_id <> p_operation_cycle_id
+      and oc.start_date <= v_cycle_end
+      and oc.end_date >= v_cycle_start
+    limit 1;
+    if v_conflict_cycle_name is not null then
+      raise exception '이 프로그램은 이미 기간이 겹치는 다른 운영구분(%)에서 운영 중입니다.', v_conflict_cycle_name;
+    end if;
+
+    insert into public.operation_terms (
+      organization_id, program_id, business_year_id, operation_cycle_id, name,
+      start_date, end_date, session_start_time, session_end_time, weekdays,
+      instructor_principal_id, instructor_name_text, schedule_mode, status, created_by
+    ) values (
+      v_org, p_program_id, v_cycle_year, p_operation_cycle_id, v_cycle_name,
+      v_cycle_start, v_cycle_end, p_start_time, p_end_time, v_final_weekdays,
+      p_instructor_principal_id, v_instructor_text, p_schedule_mode, 'scheduled', public.current_principal_id()
+    )
+    returning id into v_term_id;
+
+    v_seq := 0;
+    if p_schedule_mode = 'weekly' then
+      for v_date in
+        select d from public.compute_session_dates(v_cycle_start, v_cycle_end, p_weekdays) as d
+        where d <> all (coalesce(p_excluded_dates, '{}'))
+      loop
+        v_seq := v_seq + 1;
+        insert into public.sessions (organization_id, operation_term_id, session_no, starts_at, ends_at, status)
+        values (v_org, v_term_id, v_seq, (v_date + p_start_time) at time zone 'Asia/Seoul',
+          (v_date + p_end_time) at time zone 'Asia/Seoul', 'scheduled');
+      end loop;
+    else
+      for v_date in select distinct d from unnest(p_explicit_dates) as d order by d
+      loop
+        v_seq := v_seq + 1;
+        insert into public.sessions (organization_id, operation_term_id, session_no, starts_at, ends_at, status)
+        values (v_org, v_term_id, v_seq, (v_date + p_start_time) at time zone 'Asia/Seoul',
+          (v_date + p_end_time) at time zone 'Asia/Seoul', 'scheduled');
+      end loop;
+    end if;
+
+    if v_seq = 0 then
+      raise exception '생성될 회차가 없습니다(기간/요일/날짜를 확인해 주세요).';
+    end if;
+
+    return query select v_term_id, true, true;
+    return;
+  end if;
+
+  v_unchanged :=
+    p_schedule_mode = 'weekly'
+    and v_cur_schedule_mode = 'weekly'
+    and v_cur_weekdays = p_weekdays
+    and v_cur_start = p_start_time
+    and v_cur_end = p_end_time;
+
+  if v_unchanged then
+    if v_cur_instructor is distinct from p_instructor_principal_id
+      or v_cur_instructor_text is distinct from v_instructor_text then
+      update public.operation_terms
+      set instructor_principal_id = p_instructor_principal_id,
+          instructor_name_text = v_instructor_text
+      where id = v_term_id;
+    end if;
+    return query select v_term_id, false, false;
+    return;
+  end if;
+
+  select count(*) into v_protected_count
+  from public.sessions s
+  where s.operation_term_id = v_term_id
+    and (
+      s.starts_at <= now()
+      or exists (select 1 from public.final_attendance fa where fa.session_id = s.id)
+      or exists (select 1 from public.instructor_attendance_submissions ias where ias.session_id = s.id)
+    );
+
+  if v_protected_count > 0 then
+    raise exception '이미 출석기록이 있는 회기가 있어 전체 일정을 자동 변경할 수 없습니다. 예외 일정은 회차 단위로 수정해 주세요.';
+  end if;
+
+  delete from public.sessions where operation_term_id = v_term_id;
+
+  update public.operation_terms
+  set weekdays = v_final_weekdays,
+      session_start_time = p_start_time,
+      session_end_time = p_end_time,
+      instructor_principal_id = p_instructor_principal_id,
+      instructor_name_text = v_instructor_text,
+      schedule_mode = p_schedule_mode
+  where id = v_term_id;
+
+  v_seq := 0;
+  if p_schedule_mode = 'weekly' then
+    for v_date in
+      select d from public.compute_session_dates(v_cycle_start, v_cycle_end, p_weekdays) as d
+      where d <> all (coalesce(p_excluded_dates, '{}'))
+    loop
+      v_seq := v_seq + 1;
+      insert into public.sessions (organization_id, operation_term_id, session_no, starts_at, ends_at, status)
+      values (v_org, v_term_id, v_seq, (v_date + p_start_time) at time zone 'Asia/Seoul',
+        (v_date + p_end_time) at time zone 'Asia/Seoul', 'scheduled');
+    end loop;
+  else
+    for v_date in select distinct d from unnest(p_explicit_dates) as d order by d
+    loop
+      v_seq := v_seq + 1;
+      insert into public.sessions (organization_id, operation_term_id, session_no, starts_at, ends_at, status)
+      values (v_org, v_term_id, v_seq, (v_date + p_start_time) at time zone 'Asia/Seoul',
+        (v_date + p_end_time) at time zone 'Asia/Seoul', 'scheduled');
+    end loop;
+  end if;
+
+  if v_seq = 0 then
+    raise exception '생성될 회차가 없습니다(기간/요일/날짜를 확인해 주세요).';
+  end if;
+
+  return query select v_term_id, false, true;
+end;
+$$;
